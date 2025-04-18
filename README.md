@@ -30,7 +30,7 @@ Discord server with webhook access
    DISCORD_WEBHOOK_URL: Your Discord channel’s webhook URL.
    CHECK_INTERVAL: Time between checks in seconds (default: 1800 = 30 minutes).
 
-4. Run the script:
+5. Run the script:
    ```sh
    python unfollow_monitor.py
    ```
