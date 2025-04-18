@@ -25,10 +25,10 @@ Discord server with webhook access
 2. Edit the .env file 
 
 3. Change:
-   INSTAGRAM_USERNAME / INSTAGRAM_PASSWORD: Credentials for your bot Instagram account.
-   TARGET_USERNAME: The Instagram account you want to monitor.
-   DISCORD_WEBHOOK_URL: Your Discord channel’s webhook URL.
-   CHECK_INTERVAL: Time between checks in seconds (default: 1800 = 30 minutes).
+INSTAGRAM_USERNAME / INSTAGRAM_PASSWORD: Credentials for your bot Instagram account.
+TARGET_USERNAME: The Instagram account you want to monitor.
+DISCORD_WEBHOOK_URL: Your Discord channel’s webhook URL.
+CHECK_INTERVAL: Time between checks in seconds (default: 1800 = 30 minutes).
 
 5. Run the script:
    ```sh
