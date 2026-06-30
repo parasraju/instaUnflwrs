@@ -5,10 +5,8 @@ import requests
 import instaloader
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configuration
 FOLLOWERS_FILE = "followers.json"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 1800))
 
