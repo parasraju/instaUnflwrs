@@ -1,34 +1,58 @@
 import os
+import sys
 import time
 import json
+import signal
+import logging
+import argparse
 import requests
 import instaloader
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
 FOLLOWERS_FILE = "followers.json"
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 1800))
+MAX_DISCORD_MSG_LENGTH = 1900
 
-def get_followers():
-    L = instaloader.Instaloader()
+def setup_logging(verbose):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+def validate_env():
+    required = [
+        "INSTAGRAM_USERNAME",
+        "INSTAGRAM_PASSWORD",
+        "DISCORD_WEBHOOK_URL"
+    ]
+    missing = [v for v in required if not os.getenv(v)]
+    if missing:
+        logging.error("Missing required env vars: %s", ", ".join(missing))
+        sys.exit(1)
+    raw = os.getenv("CHECK_INTERVAL", "1800")
     try:
-        L.login(
-            os.getenv("INSTAGRAM_USERNAME"),
-            os.getenv("INSTAGRAM_PASSWORD")
-        )
-        profile = instaloader.Profile.from_username(
-            L.context,
-            os.getenv("TARGET_USERNAME")
-        )
-        return set(follower.username for follower in profile.get_followers())
-    except Exception as e:
-        print(f"Error fetching followers: {str(e)}")
-        return None
+        return int(raw)
+    except ValueError:
+        logging.error("CHECK_INTERVAL must be an integer, got: %s", raw)
+        sys.exit(1)
+
+def login(L):
+    L.login(os.getenv("INSTAGRAM_USERNAME"), os.getenv("INSTAGRAM_PASSWORD"))
+
+def get_followers(L):
+    profile = instaloader.Profile.from_username(
+        L.context, L.context.username
+    )
+    return set(follower.username for follower in profile.get_followers())
 
 def save_followers(followers):
     with open(FOLLOWERS_FILE, "w") as f:
         json.dump(list(followers), f)
+    logging.info("Saved %d followers to %s", len(followers), FOLLOWERS_FILE)
 
 def load_previous_followers():
     try:
@@ -37,31 +61,139 @@ def load_previous_followers():
     except FileNotFoundError:
         return set()
 
-def send_discord_notification(unfollowers):
-    if not unfollowers:
-        return
+def truncate(text, limit=MAX_DISCORD_MSG_LENGTH):
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+def send_discord_notification(unfollowers, new_followers):
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    message = f"🚨 **Unfollowers detected:** {', '.join(unfollowers)}"
-    requests.post(webhook_url, json={"content": message})
+    embeds = []
+
+    if unfollowers:
+        embeds.append({
+            "title": "Unfollowers Detected",
+            "description": truncate(", ".join(unfollowers)),
+            "color": 0xFF4444,
+            "footer": {"text": f"Total: {len(unfollowers)}"},
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+
+    if new_followers:
+        embeds.append({
+            "title": "New Followers",
+            "description": truncate(", ".join(new_followers)),
+            "color": 0x44FF44,
+            "footer": {"text": f"Total: {len(new_followers)}"},
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+
+    if not embeds:
+        return
+
+    try:
+        resp = requests.post(webhook_url, json={"embeds": embeds}, timeout=10)
+        resp.raise_for_status()
+        logging.info(
+            "Discord notification sent: %d unfollowers, %d new followers",
+            len(unfollowers), len(new_followers)
+        )
+    except requests.RequestException as e:
+        logging.error("Failed to send Discord notification: %s", e)
 
 def main():
-    while True:
-        current_followers = get_followers()
-        if current_followers is None:
+    parser = argparse.ArgumentParser(
+        description="Instagram Unfollow Discord Notifier"
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Enable debug logging"
+    )
+    parser.add_argument(
+        "--once", "-o", action="store_true",
+        help="Run once and exit"
+    )
+    parser.add_argument(
+        "--interval", "-i", type=int, default=None,
+        help="Check interval in seconds (overrides .env)"
+    )
+    args = parser.parse_args()
+
+    setup_logging(args.verbose)
+    check_interval = args.interval if args.interval is not None else validate_env()
+
+    logging.info("Starting Instagram Unfollow Discord Notifier")
+
+    L = instaloader.Instaloader()
+    username = os.getenv("INSTAGRAM_USERNAME")
+    session_file = f"session-{username}"
+
+    try:
+        L.load_session_from_file(username, session_file)
+        logging.info("Loaded saved session from %s", session_file)
+    except FileNotFoundError:
+        logging.info("No saved session found, logging in...")
+        login(L)
+        L.save_session_to_file(session_file)
+        logging.info("Session saved to %s", session_file)
+
+    shutdown = False
+    current_followers = None
+
+    def handle_shutdown(sig, frame):
+        nonlocal shutdown
+        logging.info("Shutdown signal received, saving state...")
+        shutdown = True
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
+    while not shutdown:
+        try:
+            current_followers = get_followers(L)
+            logging.info("Fetched %d followers", len(current_followers))
+        except Exception as e:
+            logging.error("Error fetching followers: %s", e)
+            if args.once:
+                break
             time.sleep(60)
             continue
 
         previous_followers = load_previous_followers()
-        unfollowers = previous_followers - current_followers
 
-        if unfollowers:
-            send_discord_notification(unfollowers)
-            save_followers(current_followers)
-        elif not previous_followers:  # First run
-            save_followers(current_followers)
+        if previous_followers:
+            unfollowers = previous_followers - current_followers
+            new_followers = current_followers - previous_followers
+        else:
+            unfollowers = set()
+            new_followers = set()
 
-        print(f"Checked at {time.ctime()} | Unfollowers: {len(unfollowers)}")
-        time.sleep(CHECK_INTERVAL)
+        if unfollowers or new_followers:
+            send_discord_notification(unfollowers, new_followers)
+            save_followers(current_followers)
+        elif not previous_followers:
+            save_followers(current_followers)
+            logging.info("First run — saved initial follower snapshot")
+
+        logging.info(
+            "Checked at %s | Unfollowers: %d | New: %d",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            len(unfollowers), len(new_followers)
+        )
+
+        if args.once:
+            break
+
+        for _ in range(check_interval // 5):
+            if shutdown:
+                break
+            time.sleep(5)
+        if not shutdown and check_interval % 5:
+            time.sleep(check_interval % 5)
+
+    if current_followers is not None:
+        save_followers(current_followers)
+    logging.info("Shutdown complete")
 
 if __name__ == "__main__":
     main()
