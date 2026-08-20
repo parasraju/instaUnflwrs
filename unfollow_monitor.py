@@ -23,7 +23,7 @@ def setup_logging(verbose):
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-def validate_env():
+def validate_required_env():
     required = [
         "INSTAGRAM_USERNAME",
         "INSTAGRAM_PASSWORD",
@@ -33,12 +33,17 @@ def validate_env():
     if missing:
         logging.error("Missing required env vars: %s", ", ".join(missing))
         sys.exit(1)
-    raw = os.getenv("CHECK_INTERVAL", "1800")
+
+def parse_check_interval(raw):
     try:
-        return int(raw)
-    except ValueError:
+        interval = int(raw)
+    except (TypeError, ValueError):
         logging.error("CHECK_INTERVAL must be an integer, got: %s", raw)
         sys.exit(1)
+    if interval <= 0:
+        logging.error("CHECK_INTERVAL must be a positive integer, got: %s", raw)
+        sys.exit(1)
+    return interval
 
 def login(L):
     L.login(os.getenv("INSTAGRAM_USERNAME"), os.getenv("INSTAGRAM_PASSWORD"))
@@ -57,9 +62,16 @@ def save_followers(followers):
 def load_previous_followers():
     try:
         with open(FOLLOWERS_FILE, "r") as f:
-            return set(json.load(f))
+            data = json.load(f)
     except FileNotFoundError:
-        return set()
+        return None
+    except json.JSONDecodeError as e:
+        logging.error("Corrupt followers file %s: %s", FOLLOWERS_FILE, e)
+        sys.exit(1)
+    if not isinstance(data, list):
+        logging.error("Corrupt followers file %s: expected a JSON list", FOLLOWERS_FILE)
+        sys.exit(1)
+    return set(data)
 
 def truncate(text, limit=MAX_DISCORD_MSG_LENGTH):
     if len(text) > limit:
@@ -89,7 +101,7 @@ def send_discord_notification(unfollowers, new_followers):
         })
 
     if not embeds:
-        return
+        return True
 
     try:
         resp = requests.post(webhook_url, json={"embeds": embeds}, timeout=10)
@@ -98,8 +110,10 @@ def send_discord_notification(unfollowers, new_followers):
             "Discord notification sent: %d unfollowers, %d new followers",
             len(unfollowers), len(new_followers)
         )
+        return True
     except requests.RequestException as e:
         logging.error("Failed to send Discord notification: %s", e)
+        return False
 
 def main():
     parser = argparse.ArgumentParser(
@@ -120,7 +134,11 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.verbose)
-    check_interval = args.interval if args.interval is not None else validate_env()
+    validate_required_env()
+    if args.interval is not None:
+        check_interval = parse_check_interval(args.interval)
+    else:
+        check_interval = parse_check_interval(os.getenv("CHECK_INTERVAL", "1800"))
 
     logging.info("Starting Instagram Unfollow Discord Notifier")
 
@@ -139,6 +157,7 @@ def main():
 
     shutdown = False
     current_followers = None
+    persist_on_exit = True
 
     def handle_shutdown(sig, frame):
         nonlocal shutdown
@@ -161,19 +180,24 @@ def main():
 
         previous_followers = load_previous_followers()
 
-        if previous_followers:
-            unfollowers = previous_followers - current_followers
-            new_followers = current_followers - previous_followers
-        else:
+        if previous_followers is None:
             unfollowers = set()
             new_followers = set()
-
-        if unfollowers or new_followers:
-            send_discord_notification(unfollowers, new_followers)
             save_followers(current_followers)
-        elif not previous_followers:
-            save_followers(current_followers)
+            persist_on_exit = True
             logging.info("First run — saved initial follower snapshot")
+        else:
+            unfollowers = previous_followers - current_followers
+            new_followers = current_followers - previous_followers
+            if unfollowers or new_followers:
+                if send_discord_notification(unfollowers, new_followers):
+                    save_followers(current_followers)
+                    persist_on_exit = True
+                else:
+                    persist_on_exit = False
+                    logging.warning(
+                        "Keeping previous snapshot until Discord notification succeeds"
+                    )
 
         logging.info(
             "Checked at %s | Unfollowers: %d | New: %d",
@@ -191,7 +215,7 @@ def main():
         if not shutdown and check_interval % 5:
             time.sleep(check_interval % 5)
 
-    if current_followers is not None:
+    if current_followers is not None and persist_on_exit:
         save_followers(current_followers)
     logging.info("Shutdown complete")
 
